@@ -1,0 +1,77 @@
+name: M365 security scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: Tenant ID to scan
+        required: true
+      org_name:
+        description: Name for the report
+        required: true
+
+# id-token: write lets the job request a GitHub OIDC token.
+# Nothing else in this workflow needs write access.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Ask GitHub for a short-lived OIDC token meant for Entra ID.
+      - id: oidc
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const t = await core.getIDToken('api://AzureADTokenExchange');
+            core.setSecret(t);
+            core.setOutput('token', t);
+
+      # Trade the GitHub token for a Microsoft Graph token. Entra ID accepts it
+      # because the app registration has a federated credential that trusts this
+      # repo. No client secret or certificate is stored anywhere.
+      - name: Get a Graph token
+        id: exchange
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          TENANT_ID: ${{ inputs.tenant_id }}
+          ASSERTION: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sS -X POST "https://login.microsoftonline.com/$TENANT_ID/oauth2/v2.0/token" \
+            -d "client_id=$CLIENT_ID" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            -d "grant_type=client_credentials" \
+            -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+            --data-urlencode "client_assertion=$ASSERTION")
+          token=$(echo "$resp" | jq -r '.access_token // empty')
+          if [ -z "$token" ]; then echo "$resp" | jq '{error, error_description}'; exit 1; fi
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Install Graph modules
+        shell: pwsh
+        run: |
+          Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Identity.SignIns, Microsoft.Graph.Identity.DirectoryManagement, Microsoft.Graph.DeviceManagement, Microsoft.Graph.Reports -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+
+      - name: Run the scan
+        shell: pwsh
+        env:
+          GRAPH_TOKEN: ${{ steps.exchange.outputs.token }}
+          TENANT_ID: ${{ inputs.tenant_id }}
+          ORG_NAME: ${{ inputs.org_name }}
+        run: |
+          ./Invoke-M365SecurityScan.ps1 -AccessToken $env:GRAPH_TOKEN -TenantId $env:TENANT_ID -OrgName $env:ORG_NAME -OutputPath out
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v7
+        with:
+          name: m365-security-scan
+          path: out/*
+          retention-days: 7
